@@ -27,4 +27,5 @@ pub struct ResultEntry {
 pub enum DataKey {
     InstanceState,
     Result(u64), // keyed by match_id
+    PendingAdmin, // proposed new admin address awaiting acceptance
 }

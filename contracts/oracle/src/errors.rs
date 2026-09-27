@@ -25,6 +25,7 @@ pub use smile4money_common::SharedError;
 /// | 11   | InvalidGameId      | ✓       | game_id is empty, exceeds 64 bytes, or contains invalid chars |
 /// | 15   | TransferFailed     | ✓       | Token transfer in withdraw failed                        |
 /// | 23   | InvalidAdmin       | ✓       | new_admin is the zero/burn address                       |
+/// | 24   | NoPendingAdmin     |         | accept_admin/cancel called with no pending proposal      |
 ///
 /// > **Note**: Error codes for shared variants were unified with the escrow contract.
 /// > Previously `Unauthorized` was 1, `AlreadyInitialized` was 4, `InvalidGameId` was 5,
@@ -64,6 +65,10 @@ pub enum Error {
     /// brick the contract because the zero address can never sign a transaction.
     /// **Shared** — same code as [`SharedError::InvalidAdmin`].
     InvalidAdmin = 23,
+
+    /// [E024] `accept_admin` or `cancel_admin_transfer` was called but there is no
+    /// pending admin proposal outstanding.
+    NoPendingAdmin = 24,
 }
 
 /// Convert a [`SharedError`] into an oracle [`Error`].

@@ -251,24 +251,23 @@ impl OracleContract {
         env.storage().persistent().has(&DataKey::Result(match_id))
     }
 
-    /// Transfer admin rights to a new address.
+    /// Step 1 of two-step admin transfer: propose a new admin address.
     ///
-    /// Used to rotate the oracle service key without redeploying the contract. Requires
-    /// authorization from the current admin.
+    /// Records `new_admin` as the pending admin. The transfer is not effective until
+    /// the proposed address calls [`accept_admin`]. Only the current admin may call
+    /// this function. Replaces any previously outstanding proposal.
     ///
     /// # Arguments
     ///
-    /// * `new_admin` — The Stellar address of the replacement oracle service.
+    /// * `new_admin` — The Stellar address being nominated as the next admin.
     ///
     /// # Errors
     ///
-    /// * [`Error::Unauthorized`]  — The current admin has not signed the transaction, or
-    ///   the contract has not been initialized.
-    /// * [`Error::InvalidAdmin`]  — `new_admin` is the all-zeroes contract address
-    ///   (`CAAAA…AAAD2KM`). That address can never sign, so storing it would permanently
-    ///   brick the contract.
-    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
-        let mut instance_state: InstanceState = env
+    /// * [`Error::Unauthorized`]  — Contract not initialized or caller is not the admin.
+    /// * [`Error::InvalidAdmin`]  — `new_admin` is the zero/burn address or is the same
+    ///   as the current admin.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let instance_state: InstanceState = env
             .storage()
             .instance()
             .get(&DataKey::InstanceState)
@@ -276,10 +275,7 @@ impl OracleContract {
         let admin = instance_state.admin.clone();
         admin.require_auth();
 
-        // Reject the zero/burn address. The all-zeroes contract address
-        // (CAAAA...AAAD2KM in strkey encoding) can never sign a transaction.
-        // Storing it as admin would permanently brick the contract — no future
-        // transfer_admin, submit_result, or withdraw call could ever succeed.
+        // Reject the zero/burn address — it can never sign a transaction.
         let zero_addr = Address::from_strkey(
             &env,
             &soroban_sdk::String::from_str(
@@ -291,24 +287,114 @@ impl OracleContract {
             return Err(Error::InvalidAdmin);
         }
 
-        // If the new admin is the same as the current admin, treat this as a no-op.
-        // Do not update storage or emit an `adm_xfer` event to avoid misleading
-        // on-chain audit trails and false-positive off-chain alerts.
+        // Proposing the current admin as the next admin makes no sense.
         if new_admin == admin {
-            return Ok(());
+            return Err(Error::InvalidAdmin);
         }
 
-        instance_state.admin = new_admin.clone();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle"), symbol_short!("adm_prop")),
+            (admin, new_admin),
+        );
+
+        Ok(())
+    }
+
+    /// Step 2 of two-step admin transfer: the proposed admin accepts the role.
+    ///
+    /// Completes the transfer by writing the pending admin as the active admin and
+    /// clearing the pending proposal. Only the address that was proposed via
+    /// [`propose_admin`] may call this function.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`]    — Contract not initialized or caller is not the
+    ///   pending admin.
+    /// * [`Error::NoPendingAdmin`]  — No proposal is outstanding.
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        let mut instance_state: InstanceState = env
+            .storage()
+            .instance()
+            .get(&DataKey::InstanceState)
+            .ok_or(Error::Unauthorized)?;
+
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingAdmin)?;
+
+        pending.require_auth();
+
+        let old_admin = instance_state.admin.clone();
+        instance_state.admin = pending.clone();
         env.storage()
             .instance()
             .set(&DataKey::InstanceState, &instance_state);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdmin);
         env.storage()
             .instance()
             .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
 
         env.events().publish(
             (Symbol::new(&env, "oracle"), symbol_short!("adm_xfer")),
-            (admin, new_admin),
+            (old_admin, pending),
+        );
+
+        Ok(())
+    }
+
+    /// Cancel an outstanding admin transfer proposal.
+    ///
+    /// Removes the pending admin address without changing the active admin. Only the
+    /// current admin may call this function.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`]   — Contract not initialized or caller is not the admin.
+    /// * [`Error::NoPendingAdmin`] — No proposal is outstanding.
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
+        let instance_state: InstanceState = env
+            .storage()
+            .instance()
+            .get(&DataKey::InstanceState)
+            .ok_or(Error::Unauthorized)?;
+        let admin = instance_state.admin;
+        admin.require_auth();
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::PendingAdmin)
+        {
+            return Err(Error::NoPendingAdmin);
+        }
+
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap();
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdmin);
+        env.storage()
+            .instance()
+            .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle"), symbol_short!("adm_cncl")),
+            (admin, pending),
         );
 
         Ok(())
@@ -553,13 +639,18 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_admin_success() {
+    fn test_propose_and_accept_admin_happy_path() {
         let (env, contract_id) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
         let new_admin = Address::generate(&env);
-        client.transfer_admin(&new_admin);
 
-        // new admin can now submit a result; old admin cannot drive auth
+        // Step 1: current admin proposes
+        client.propose_admin(&new_admin);
+
+        // Step 2: proposed admin accepts
+        client.accept_admin();
+
+        // The new admin can now submit results
         client.submit_result(
             &1u64,
             &String::from_str(&env, "game1"),
@@ -569,11 +660,28 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_admin_emits_event() {
+    fn test_propose_admin_emits_proposal_event() {
         let (env, contract_id) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
         let new_admin = Address::generate(&env);
-        client.transfer_admin(&new_admin);
+        client.propose_admin(&new_admin);
+
+        let events = env.events().all();
+        let topics = vec![
+            &env,
+            Symbol::new(&env, "oracle").into_val(&env),
+            soroban_sdk::symbol_short!("adm_prop").into_val(&env),
+        ];
+        assert!(events.iter().any(|(_, t, _)| t == topics), "adm_prop event must be emitted");
+    }
+
+    #[test]
+    fn test_accept_admin_emits_transfer_event() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin);
+        client.accept_admin();
 
         let events = env.events().all();
         let topics = vec![
@@ -581,31 +689,28 @@ mod tests {
             Symbol::new(&env, "oracle").into_val(&env),
             soroban_sdk::symbol_short!("adm_xfer").into_val(&env),
         ];
-        assert!(events.iter().any(|(_, t, _)| t == topics));
+        assert!(events.iter().any(|(_, t, _)| t == topics), "adm_xfer event must be emitted on accept");
     }
 
     #[test]
-    fn test_transfer_admin_extends_instance_ttl() {
+    fn test_accept_admin_extends_instance_ttl() {
         let (env, contract_id) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
         let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin);
 
-        // Get TTL before transfer
         let ttl_before = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
-
-        // Transfer admin
-        client.transfer_admin(&new_admin);
-
-        // Get TTL after transfer — should be extended
+        client.accept_admin();
         let ttl_after = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+
         assert!(
             ttl_after >= crate::MATCH_TTL_LEDGERS,
-            "Instance TTL must be extended after transfer_admin"
+            "Instance TTL must be extended after accept_admin: before={ttl_before}, after={ttl_after}"
         );
     }
 
     #[test]
-    fn test_non_admin_cannot_transfer_admin() {
+    fn test_non_admin_cannot_propose_admin() {
         let env = Env::default();
         let admin = Address::generate(&env);
         let non_admin = Address::generate(&env);
@@ -619,38 +724,216 @@ mod tests {
             address: &non_admin,
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
-                fn_name: "transfer_admin",
+                fn_name: "propose_admin",
                 args: (new_admin.clone(),).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
 
-        assert!(client.try_transfer_admin(&new_admin).is_err());
+        assert!(
+            client.try_propose_admin(&new_admin).is_err(),
+            "non-admin must not be able to propose a new admin"
+        );
     }
 
     #[test]
-    fn transfer_admin_by_non_admin_is_rejected() {
+    fn test_non_pending_cannot_accept_admin() {
         let env = Env::default();
         let admin = Address::generate(&env);
-        let non_admin = Address::generate(&env);
-        let new_admin = Address::generate(&env);
+        let proposed = Address::generate(&env);
+        let impostor = Address::generate(&env);
         let contract_id = env.register(OracleContract, ());
         let client = OracleContractClient::new(&env, &contract_id);
         client.initialize(&admin);
+
+        // Propose `proposed`, but have `impostor` try to accept
+        env.mock_all_auths_allowing_non_root_auth();
+        client.propose_admin(&proposed);
+
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        env.mock_auths(&[MockAuth {
+            address: &impostor,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        // Should fail because require_auth() on `proposed` won't be satisfied by `impostor`
+        assert!(
+            client.try_accept_admin().is_err(),
+            "only the pending admin must be able to accept"
+        );
+    }
+
+    #[test]
+    fn test_accept_admin_without_proposal_returns_no_pending_admin() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.try_accept_admin(),
+            Err(Ok(Error::NoPendingAdmin)),
+            "accept_admin with no outstanding proposal must return NoPendingAdmin"
+        );
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_clears_proposal() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let new_admin = Address::generate(&env);
+
+        client.propose_admin(&new_admin);
+        client.cancel_admin_transfer();
+
+        // accept should now fail with NoPendingAdmin
+        assert_eq!(
+            client.try_accept_admin(),
+            Err(Ok(Error::NoPendingAdmin)),
+            "after cancellation there must be no pending proposal"
+        );
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_emits_event() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin);
+        client.cancel_admin_transfer();
+
+        let events = env.events().all();
+        let topics = vec![
+            &env,
+            Symbol::new(&env, "oracle").into_val(&env),
+            soroban_sdk::symbol_short!("adm_cncl").into_val(&env),
+        ];
+        assert!(events.iter().any(|(_, t, _)| t == topics), "adm_cncl event must be emitted");
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_without_proposal_returns_no_pending_admin() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.try_cancel_admin_transfer(),
+            Err(Ok(Error::NoPendingAdmin)),
+            "cancel with no outstanding proposal must return NoPendingAdmin"
+        );
+    }
+
+    #[test]
+    fn test_non_admin_cannot_cancel_admin_transfer() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+        let proposed = Address::generate(&env);
+        let contract_id = env.register(OracleContract, ());
+        let client = OracleContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+        env.mock_all_auths_allowing_non_root_auth();
+        client.propose_admin(&proposed);
 
         use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
         env.mock_auths(&[MockAuth {
             address: &non_admin,
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
-                fn_name: "transfer_admin",
-                args: (new_admin.clone(),).into_val(&env),
+                fn_name: "cancel_admin_transfer",
+                args: ().into_val(&env),
                 sub_invokes: &[],
             },
         }]);
 
-        // Auth failure from require_auth() surfaces as a host error (Err variant).
-        assert!(client.try_transfer_admin(&new_admin).is_err());
+        assert!(
+            client.try_cancel_admin_transfer().is_err(),
+            "non-admin must not be able to cancel a pending proposal"
+        );
+    }
+
+    #[test]
+    fn test_propose_admin_zero_address_returns_invalid_admin() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+
+        let zero_addr = Address::from_strkey(
+            &env,
+            &String::from_str(
+                &env,
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            ),
+        );
+
+        assert_eq!(
+            client.try_propose_admin(&zero_addr),
+            Err(Ok(Error::InvalidAdmin)),
+            "propose_admin must reject the zero address with InvalidAdmin"
+        );
+    }
+
+    #[test]
+    fn test_propose_admin_self_returns_invalid_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(OracleContract, ());
+        let client = OracleContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        assert_eq!(
+            client.try_propose_admin(&admin),
+            Err(Ok(Error::InvalidAdmin)),
+            "proposing the current admin must return InvalidAdmin"
+        );
+    }
+
+    #[test]
+    fn test_pending_admin_cleared_after_accept() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let new_admin = Address::generate(&env);
+
+        client.propose_admin(&new_admin);
+        client.accept_admin();
+
+        // A second accept must now fail — the pending key was cleared
+        assert_eq!(
+            client.try_accept_admin(),
+            Err(Ok(Error::NoPendingAdmin)),
+            "pending admin must be cleared after successful accept"
+        );
+    }
+
+    #[test]
+    fn test_propose_admin_replaces_previous_proposal() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let first_candidate = Address::generate(&env);
+        let second_candidate = Address::generate(&env);
+
+        client.propose_admin(&first_candidate);
+        // Replace the proposal with a different address
+        client.propose_admin(&second_candidate);
+
+        // first_candidate can no longer accept
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        env.mock_auths(&[MockAuth {
+            address: &first_candidate,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(
+            client.try_accept_admin().is_err(),
+            "first candidate must not be able to accept after proposal was replaced"
+        );
     }
 
     #[test]
@@ -1063,16 +1346,15 @@ mod tests {
         assert_eq!(past_end.len(), 0);
     }
 
-    // ── Issue #1513: transfer_admin must reject the zero/burn address ─────────
+    // ── Issue #1513 / #1706: two-step admin transfer — zero address guard ────
 
     #[test]
-    fn test_transfer_admin_zero_address_returns_invalid_admin() {
+    fn test_propose_admin_zero_address_returns_invalid_admin_and_contract_remains_operational() {
         let (env, contract_id) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
 
         // The all-zeroes contract address (C-strkey) can never sign a transaction.
-        // Passing it to transfer_admin must return Error::InvalidAdmin so the
-        // contract cannot be permanently bricked.
+        // Passing it to propose_admin must return Error::InvalidAdmin.
         let zero_addr = Address::from_strkey(
             &env,
             &String::from_str(
@@ -1082,17 +1364,17 @@ mod tests {
         );
 
         assert_eq!(
-            client.try_transfer_admin(&zero_addr),
+            client.try_propose_admin(&zero_addr),
             Err(Ok(Error::InvalidAdmin)),
-            "transfer_admin must reject the zero address with InvalidAdmin"
+            "propose_admin must reject the zero address with InvalidAdmin"
         );
 
-        // Confirm the admin was NOT updated — the contract is still functional.
+        // Confirm the contract is still functional — no pending admin was stored.
         client.submit_result(
             &0u64,
             &String::from_str(&env, "game1"),
             &MatchResult::Player1Wins,
         );
-        assert!(client.has_result(&0u64), "contract must remain operational after rejected transfer");
+        assert!(client.has_result(&0u64), "contract must remain operational after rejected proposal");
     }
 }
