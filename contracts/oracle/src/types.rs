@@ -26,6 +26,7 @@ pub struct ResultEntry {
 #[contracttype]
 pub enum DataKey {
     InstanceState,
+    IsInitialized,
     Result(u64), // keyed by match_id
     PendingAdmin, // proposed new admin address awaiting acceptance
 }

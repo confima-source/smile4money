@@ -86,6 +86,14 @@ fn is_valid_game_id(game_id: &String) -> bool {
     true
 }
 
+fn bump_initialized_ttl(env: &Env) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::IsInitialized,
+        MATCH_TTL_LEDGERS,
+        MATCH_TTL_LEDGERS,
+    );
+}
+
 #[contract]
 pub struct OracleContract;
 
@@ -105,9 +113,11 @@ impl OracleContract {
     ///
     /// Returns [`Error::AlreadyInitialized`] if the contract has already been set up.
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
-        if env.storage().instance().has(&DataKey::InstanceState) {
+        if env.storage().persistent().has(&DataKey::IsInitialized) {
             return Err(Error::AlreadyInitialized);
         }
+        env.storage().persistent().set(&DataKey::IsInitialized, &true);
+        bump_initialized_ttl(&env);
         env.storage().instance().set(
             &DataKey::InstanceState,
             &InstanceState {
@@ -199,6 +209,7 @@ impl OracleContract {
             MATCH_TTL_LEDGERS,
             MATCH_TTL_LEDGERS,
         );
+        bump_initialized_ttl(&env);
 
         // Increment the result count so callers can construct efficient page ranges
         // without scanning sparse ID spaces.
@@ -292,6 +303,7 @@ impl OracleContract {
         env.storage()
             .instance()
             .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        bump_initialized_ttl(&env);
 
         env.events().publish(
             (Symbol::new(&env, "oracle"), symbol_short!("adm_prop")),
@@ -338,6 +350,7 @@ impl OracleContract {
         env.storage()
             .instance()
             .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        bump_initialized_ttl(&env);
 
         env.events().publish(
             (Symbol::new(&env, "oracle"), symbol_short!("adm_xfer")),
@@ -385,6 +398,7 @@ impl OracleContract {
         env.storage()
             .instance()
             .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        bump_initialized_ttl(&env);
 
         env.events().publish(
             (Symbol::new(&env, "oracle"), symbol_short!("adm_cncl")),
@@ -533,7 +547,7 @@ mod tests {
 
         client.submit_result(
             &0u64,
-            &String::from_str(&env, "abc123"),
+            &String::from_str(&env, "abc-123_XYZ"),
             &MatchResult::Player1Wins,
         );
 
@@ -568,6 +582,33 @@ mod tests {
                 &String::from_str(&env, ""),
                 &MatchResult::Player1Wins,
             ),
+            Err(Ok(Error::InvalidGameId))
+        );
+    }
+
+    #[test]
+    fn test_submit_result_invalid_game_id_characters_fail() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.try_submit_result(
+                &0u64,
+                &String::from_str(&env, "game.id"),
+                &MatchResult::Player1Wins,
+            ),
+            Err(Ok(Error::InvalidGameId))
+        );
+    }
+
+    #[test]
+    fn test_submit_result_game_id_over_max_byte_length_fails() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let game_id = String::from_bytes(&env, &[b'a'; MAX_GAME_ID_LEN as usize + 1]);
+
+        assert_eq!(
+            client.try_submit_result(&0u64, &game_id, &MatchResult::Player1Wins),
             Err(Ok(Error::InvalidGameId))
         );
     }
@@ -618,13 +659,37 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
+        let replacement_admin = Address::generate(&env);
         let contract_id = env.register(OracleContract, ());
         let client = OracleContractClient::new(&env, &contract_id);
         client.initialize(&admin);
+
+        let initial_admin = env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .get::<DataKey, InstanceState>(&DataKey::InstanceState)
+                .unwrap()
+                .admin
+        });
+        assert_eq!(initial_admin, admin);
+        assert!(env.as_contract(&contract_id, || env
+            .storage()
+            .persistent()
+            .has(&DataKey::IsInitialized)));
+
         assert_eq!(
-            client.try_initialize(&admin),
+            client.try_initialize(&replacement_admin),
             Err(Ok(Error::AlreadyInitialized))
         );
+
+        let admin_after_retry = env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .get::<DataKey, InstanceState>(&DataKey::InstanceState)
+                .unwrap()
+                .admin
+        });
+        assert_eq!(admin_after_retry, admin);
     }
 
     #[test]

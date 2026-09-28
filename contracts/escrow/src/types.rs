@@ -382,10 +382,10 @@ pub enum DataKey {
 
     /// The pre-registered destination address for [`emergency_drain`](crate::EscrowContract::emergency_drain).
     ///
-    /// Set immutably during [`initialize`](crate::EscrowContract::initialize).
-    /// `emergency_drain` always transfers funds to this address — it cannot
-    /// be overridden at call time. This eliminates the rug-pull vector where
-    /// a compromised admin key could redirect the drain to an arbitrary address.
+    /// Write-once: the only write is during [`initialize`](crate::EscrowContract::initialize),
+    /// and there is deliberately no setter. `emergency_drain` always transfers funds to this
+    /// address — it cannot be overridden at call time. This prevents a compromised admin key
+    /// from redirecting the drain to an arbitrary address and stealing escrowed funds.
     /// Stored in **instance** storage.
     SafeAddress,
 
