@@ -1759,12 +1759,19 @@ fn test_ttl_extended_on_state_changes() {
 
     assert_eq!(check_ttl(DataKey::Match(id)), crate::MATCH_TTL_LEDGERS);
 
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 100);
+    assert!(check_ttl(DataKey::Match(id)) < crate::MATCH_TTL_LEDGERS);
     client.deposit(&id, &player1);
     assert_eq!(check_ttl(DataKey::Match(id)), crate::MATCH_TTL_LEDGERS);
 
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 100);
     client.deposit(&id, &player2);
     assert_eq!(check_ttl(DataKey::Match(id)), crate::MATCH_TTL_LEDGERS);
 
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 100);
     client.submit_result(
         &id,
         &String::from_str(&env, "ttl_game"),
@@ -1772,6 +1779,30 @@ fn test_ttl_extended_on_state_changes() {
         &oracle,
     );
     assert_eq!(check_ttl(DataKey::Match(id)), crate::MATCH_TTL_LEDGERS);
+}
+
+#[test]
+fn test_safe_address_is_only_written_during_initialize() {
+    let source = include_str!("lib.rs");
+    let compact_source: std::string::String = source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let safe_address_writes = compact_source.matches("set(&DataKey::SafeAddress").count();
+    let initialize_body = source
+        .split("pub fn initialize(")
+        .nth(1)
+        .unwrap()
+        .split("pub fn update_oracle(")
+        .next()
+        .unwrap();
+
+    assert_eq!(safe_address_writes, 1);
+    let compact_initialize: std::string::String = initialize_body
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    assert!(compact_initialize.contains("set(&DataKey::SafeAddress"));
 }
 
 #[test]
