@@ -236,6 +236,20 @@ impl EscrowContract {
         env.storage().instance().set(&DataKey::Oracle, &oracle);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
+
+        // Seed the allowlist with the default token so a contract that is
+        // never extended behaves exactly as it did before the allowlist
+        // existed: the only accepted token is the one passed to `initialize`.
+        // `remove_token` refuses to remove this entry, so the contract can
+        // never be left with no acceptable token at all.
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenAllowlisted(token.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TokenAllowlisted(token.clone()),
+            MATCH_TTL_LEDGERS,
+            MATCH_TTL_LEDGERS,
+        );
         env.storage()
             .instance()
             .set(&DataKey::SafeAddress, &safe_address);
@@ -352,12 +366,29 @@ impl EscrowContract {
     }
 
     /// Create a new match. Both players must call `deposit` before the game starts.
+    ///
+    /// `token` selects which SEP-41 token this match is escrowed in. Passing
+    /// `None` uses the contract's default token (the one supplied to
+    /// [`initialize`](EscrowContract::initialize)), which is what a caller that
+    /// does not care about the currency should do.
+    ///
+    /// A non-`None` token must be on the admin-managed allowlist
+    /// ([`add_token`](EscrowContract::add_token)); otherwise the call fails with
+    /// [`Error::TokenNotAllowlisted`]. This is what stops a caller from naming
+    /// an arbitrary SEP-41 contract and having the escrow pull funds through
+    /// it.
+    ///
+    /// The chosen token is copied into [`Match::token`] at creation and is the
+    /// token [`deposit`](EscrowContract::deposit) pulls and the payout pays
+    /// out in. A later `remove_token` does **not** disturb matches that already
+    /// exist: it stops new matches from being created in that token, leaving
+    /// in-flight escrows untouched and settleable.
     pub fn create_match(
         env: Env,
         player1: Address,
         player2: Address,
         stake_amount: i128,
-        token: Address,
+        token: Option<Address>,
         game_id: String,
         platform: Platform,
     ) -> Result<u64, Error> {
@@ -402,13 +433,27 @@ impl EscrowContract {
             return Err(Error::DuplicateGameId);
         }
 
+        // Resolve the token: an explicit argument overrides the default, and
+        // `None` means "use whatever this contract was initialized with".
         let stored_token: Address = env
             .storage()
             .instance()
             .get(&DataKey::Token)
             .ok_or(Error::Unauthorized)?;
-        if token != stored_token {
-            return Err(Error::InvalidToken);
+        let token = match token {
+            Some(t) => t,
+            None => stored_token,
+        };
+
+        // The default token is allowlisted by `initialize` and cannot be
+        // removed, so checking every token — including the default — against
+        // the allowlist is both simpler and stricter than special-casing it.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::TokenAllowlisted(token.clone()))
+        {
+            return Err(Error::TokenNotAllowlisted);
         }
 
         let id: u64 = env
