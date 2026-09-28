@@ -2,19 +2,95 @@
 # Netlify and any Netlify-compatible CDN (Cloudflare Pages, etc.) honour this file.
 # The Vite dev server picks up the equivalent config from vite.config.ts.
 #
-# Content Security Policy rationale:
-#   script-src 'self'         — no inline scripts, no eval; prevents XSS from
-#                               injecting scripts that could steal signed transactions
-#   connect-src               — restricts XHR/fetch to the same origin and known
-#                               Stellar RPC / Horizon endpoints
-#   object-src 'none'         — disables Flash / plugin embeds entirely
-#   frame-ancestors 'none'    — clickjacking protection
+# =============================================================================
+# CONTENT SECURITY POLICY (CSP)
+# =============================================================================
+# This strict CSP protects smile4money against XSS and data exfiltration attacks.
+# All resources must be from the same origin or explicitly whitelisted endpoints.
 #
-# When upgrading to a hash-based script-src, replace 'self' with the
-# SHA-256 hash(es) of each permitted script chunk produced by the Vite build:
-#   script-src 'sha256-<hash1>' 'sha256-<hash2>'
+# DIRECTIVES RATIONALE:
+#
+# default-src 'self'
+#   - Failsafe: any resource type not explicitly allowed defaults to same-origin only
+#   - Blocks CDN resources, inline code, and cross-origin API calls
+#   - Narrow exceptions are defined below for specific resource types
+#
+# script-src 'self'
+#   - CRITICAL: only scripts from the same origin; disables inline scripts and eval
+#   - Prevents XSS that could:
+#     * Steal the user's private key or transaction signing credentials
+#     * Inject malicious smart contract calls (e.g., sending funds to an attacker)
+#     * Redirect the user to a phishing site
+#   - Vite bundles all application code into these same-origin scripts
+#   - No external JavaScript libraries are loaded from CDNs
+#
+# style-src 'self' 'unsafe-inline'
+#   - Tailwind CSS is configured for runtime JIT, inlining critical styles into the HTML
+#   - Once the project migrates to static CSS generation, 'unsafe-inline' should be removed
+#     and replaced with style hashes or 'strict-dynamic'
+#   - Current approach: inline Tailwind CSS is necessary for the chosen build process
+#
+# connect-src 'self' <Stellar RPC endpoints>
+#   - Restricts all XHR, fetch, WebSocket, and EventSource calls
+#   - Only the same origin and official Stellar RPC endpoints are whitelisted:
+#     * soroban-testnet.stellar.org  (Stellar Soroban testnet RPC)
+#     * soroban-mainnet.stellar.org  (Stellar Soroban mainnet RPC)
+#     * horizon-testnet.stellar.org  (Stellar Horizon testnet API)
+#     * horizon.stellar.org          (Stellar Horizon mainnet API)
+#   - Prevents exfiltration of user data, private keys, or signed transactions to untrusted APIs
+#
+# img-src 'self' data:
+#   - Allows images from the same origin (e.g., /favicon.svg, /og-image.svg)
+#   - Allows data: URIs for inlined SVG (e.g., base64-encoded favicons)
+#   - No external image CDNs; all images are bundled
+#
+# font-src 'self'
+#   - Only web fonts from the same origin
+#   - No Google Fonts, Typekit, or other external font services
+#
+# media-src 'self'
+#   - Restricts audio and video to the same origin
+#
+# object-src 'none'
+#   - Disables <embed>, <object>, <applet>, and related tags entirely
+#   - Eliminates Flash-based attacks and legacy plugin vulnerabilities
+#
+# base-uri 'self'
+#   - Prevents <base> tag injection, ensuring relative URLs use the correct origin
+#
+# frame-ancestors 'none'
+#   - Clickjacking protection: denies the application from being embedded in an <iframe>
+#   - Even if an attacker tricks the user into visiting a malicious site, the app cannot be framed
+#
+# form-action 'self'
+#   - Form submissions (POST) must target the same origin
+#   - Prevents CSRF attacks that would submit forms to attacker-controlled servers
+#
+# =============================================================================
+# PRODUCTION UPGRADE PATH:
+# =============================================================================
+# As the build process evolves, consider these enhancements:
+#
+# 1. Replace 'unsafe-inline' in style-src with content-hash once Tailwind supports
+#    static CSS generation:
+#      style-src 'sha256-<tailwind-hash>'
+#
+# 2. Add script hashes if static script bundling is enabled:
+#      script-src 'sha256-<main.js-hash>' 'sha256-<chunk.js-hash>'
+#    Run: npm run build && npx lighthouse --output=json <url> | grep CSP
+#
+# 3. Consider report-uri or report-to for CSP violation monitoring in production:
+#      report-uri https://smile4money.app/csp-report
+#      report-to csp-endpoint
+#
+# 4. Monitor Google CSP Evaluator recommendations quarterly:
+#      https://csp-evaluator.withgoogle.com/
+#
+# =============================================================================
 /*
-  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://soroban-testnet.stellar.org https://soroban-mainnet.stellar.org https://horizon-testnet.stellar.org https://horizon.stellar.org; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://soroban-testnet.stellar.org https://soroban-mainnet.stellar.org https://horizon-testnet.stellar.org https://horizon.stellar.org; img-src 'self' data:; font-src 'self'; media-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
+  X-XSS-Protection: 1; mode=block
   Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: accelerometer=(), ambient-light-sensor=(), battery=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()
