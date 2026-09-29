@@ -2594,7 +2594,42 @@ mod proptest_state_machine {
         }
     }
 
-    // ── invariant 5: no operation accepted after terminal state ───────────────
+    // ── is_funded: MatchNotFound for unknown match_id ─────────────────────────
+
+/// is_funded() must return Error::MatchNotFound for a match_id that was never
+/// created (u64::MAX), not panic.
+#[test]
+fn test_is_funded_returns_match_not_found_for_unknown_id() {
+    let (env, contract_id, ..) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    assert_eq!(
+        client.try_is_funded(&u64::MAX),
+        Err(Ok(Error::MatchNotFound))
+    );
+}
+
+/// is_funded() must return Error::MatchNotFound when match_id exceeds the
+/// current match counter (e.g. no matches created, match_id = 1).
+#[test]
+fn test_is_funded_returns_match_not_found_beyond_count() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin, _safe_address) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    // Create one match (id = 0); match id 1 does not exist.
+    client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "funded_beyond"),
+        &Platform::Lichess,
+    );
+    assert_eq!(
+        client.try_is_funded(&1),
+        Err(Ok(Error::MatchNotFound))
+    );
+}
+
+// ── invariant 5: no operation accepted after terminal state ───────────────
 
     /// Comprehensive sweep: for every reachable terminal state, assert that
     /// ALL mutating operations are rejected.  This catches any future addition
