@@ -36,6 +36,79 @@ pub fn initialize(env: Env, oracle: Address, admin: Address, token: Address) -> 
 
 ### Admin Functions
 
+#### `add_token`
+
+Allowlist a SEP-41 token so matches may be created in it.
+
+**Signature:**
+```rust
+pub fn add_token(env: Env, token: Address, caller: Address) -> Result<(), Error>
+```
+
+**Behavior:**
+- Probes the token (calls `decimals`) so a typo or non-token address is
+  rejected here rather than at a player's deposit
+- Sets the allowlist flag for `token`
+- Extends TTL to `MATCH_TTL_LEDGERS`
+- Emits `("admin", "token_add")` with `(token, admin)`
+
+**Authorization:** Requires admin signature
+
+**Errors:**
+- `Error::Unauthorized`: Caller is not the admin
+- `Error::TokenAlreadyListed`: The token is already allowlisted
+
+**Note:** Allowlisting a token is *not* a statement that it is safe or liquid â€”
+only that the admin accepts it as a stake currency. The allowlist exists to
+stop an arbitrary caller from pointing the escrow at a contract of their
+choosing; the judgement about which currencies to list stays with the admin,
+and every change is recorded on-chain.
+
+---
+
+#### `remove_token`
+
+Delist a token so no new matches may be created in it.
+
+**Signature:**
+```rust
+pub fn remove_token(env: Env, token: Address, caller: Address) -> Result<(), Error>
+```
+
+**Behavior:**
+- Clears the allowlist flag for `token`
+- Emits `("admin", "token_del")` with `(token, admin)`
+
+**In-flight matches are unaffected.** Removal stops *new* matches; it does not
+touch matches that already exist. Their escrows remain in that token and still
+settle and pay out there, because a player who funded a match must be able to
+finish it. This is how an admin delists a currency that turned out to be broken
+without stranding funds.
+
+**Authorization:** Requires admin signature
+
+**Errors:**
+- `Error::Unauthorized`: Caller is not the admin
+- `Error::TokenNotListed`: The token was not allowlisted
+- `Error::CannotRemoveDefault`: The token is the contract's default
+
+---
+
+#### `is_token_allowlisted`
+
+Read-only check of whether a token is currently accepted.
+
+**Signature:**
+```rust
+pub fn is_token_allowlisted(env: Env, token: Address) -> bool
+```
+
+Allows a frontend to grey out a currency selector without attempting a doomed
+`create_match`. The default token is always allowlisted, so this never returns
+`false` for it.
+
+---
+
 #### `pause`
 
 Pause the contract to prevent new matches, deposits, and result submissions.
@@ -120,7 +193,7 @@ pub fn create_match(
     player1: Address,
     player2: Address,
     stake_amount: i128,
-    token: Address,
+    token: Option<Address>,
     game_id: String,
     platform: Platform,
 ) -> Result<u64, Error>
@@ -130,7 +203,9 @@ pub fn create_match(
 - `player1`: Address of the match creator (must sign the transaction)
 - `player2`: Address of the opponent
 - `stake_amount`: Amount each player must deposit (in the token's smallest unit)
-- `token`: Address of the SEP-41 token contract used for this match
+- `token`: SEP-41 token for this match. `None` uses the contract's default token.
+  A non-`None` value must be on the admin-managed allowlist â€” see
+  [Token Allowlist](#token-allowlist).
 - `game_id`: Unique identifier from the chess platform (max 64 bytes)
 - `platform`: Chess platform enum (`Lichess` or `ChessDotCom`)
 
@@ -142,7 +217,9 @@ pub fn create_match(
 - Validates `player1 != player2`
 - Validates `game_id` length is between 1 and 64 bytes
 - Rejects duplicate `game_id` values
-- Creates match in `Pending` state
+- Resolves `token`: the explicit argument if given, otherwise the default
+- Rejects a token that is not on the allowlist
+- Creates match in `Pending` state, recording the resolved token
 - Increments match counter with overflow check
 - Extends TTL to `MATCH_TTL_LEDGERS` (~30 days)
 - Emits `("match", "created")` event
@@ -151,24 +228,42 @@ pub fn create_match(
 
 **Errors:**
 - `Error::ContractPaused`: Contract is paused
-- `Error::InvalidAmount`: `stake_amount ≤ 0`
+- `Error::InvalidAmount`: `stake_amount â‰¤ 0`
 - `Error::InvalidPlayers`: `player1 == player2`
 - `Error::InvalidGameId`: `game_id` is empty or exceeds 64 bytes
 - `Error::DuplicateGameId`: `game_id` is already used in another match
+- `Error::TokenNotAllowlisted`: the token is not on the allowlist
 - `Error::AlreadyExists`: Match ID collision (internal counter error)
 - `Error::Overflow`: Match counter would exceed `u64::MAX`
 
 **Example:**
 ```rust
+// Use the contract's default token
 let match_id = escrow.create_match(
     &player1_addr,
     &player2_addr,
     &1_000_0000, // 100 XLM (7 decimals)
-    &xlm_token_addr,
+    &None,
     &String::from_str(&env, "lichess_abc123"),
     &Platform::Lichess,
 );
+
+// Or name an allowlisted token explicitly (e.g. USDC)
+let usdc_match = escrow.create_match(
+    &player1_addr,
+    &player2_addr,
+    &100_000000, // 100 USDC (6 decimals)
+    &Some(usdc_token_addr),
+    &String::from_str(&env, "lichess_def456"),
+    &Platform::Lichess,
+);
 ```
+
+> **Breaking change:** `token` was previously a required `Address` that had to
+> equal the token from `initialize`. It is now an `Option<Address>`, and any
+> allowlisted token is accepted. Existing clients that pass the default token
+> must wrap it in `Some(...)`; the contract's own `create_match` name and
+> argument order are otherwise unchanged.
 
 ---
 
@@ -211,7 +306,7 @@ pub fn deposit(env: Env, match_id: u64, player: Address) -> Result<(), Error>
 // Player 1 deposits
 escrow.deposit(&match_id, &player1_addr);
 
-// Player 2 deposits — match transitions to Active
+// Player 2 deposits â€” match transitions to Active
 escrow.deposit(&match_id, &player2_addr);
 ```
 
@@ -275,7 +370,7 @@ pub fn submit_result(
 
 **Parameters:**
 - `match_id`: ID of the match to finalize
-- `game_id`: Chess platform game identifier — must match the `game_id` stored in the match record
+- `game_id`: Chess platform game identifier â€” must match the `game_id` stored in the match record
 - `winner`: Result enum (`Player1`, `Player2`, or `Draw`)
 - `caller`: Address submitting the result (must be the registered oracle)
 
@@ -285,8 +380,8 @@ pub fn submit_result(
 - Validates match is in `Active` state
 - Validates both players have deposited
 - Executes payout based on `winner`:
-  - `Player1`: Transfers `stake_amount × 2` to `player1`
-  - `Player2`: Transfers `stake_amount × 2` to `player2`
+  - `Player1`: Transfers `stake_amount Ã— 2` to `player1`
+  - `Player2`: Transfers `stake_amount Ã— 2` to `player2`
   - `Draw`: Returns `stake_amount` to each player
 - Transitions to `Completed` state
 - Extends TTL to `MATCH_TTL_LEDGERS`
@@ -383,12 +478,12 @@ pub fn get_escrow_balance(env: Env, match_id: u64) -> Result<i128, Error>
 - `match_id`: ID of the match to check
 
 **Returns:**
-- `i128`: Total escrowed amount (`0`, `stake_amount`, or `2 × stake_amount`)
+- `i128`: Total escrowed amount (`0`, `stake_amount`, or `2 Ã— stake_amount`)
 
 **Behavior:**
 - Returns `0` if match is `Completed` or `Cancelled`
 - Returns `stake_amount` if exactly one player has deposited
-- Returns `2 × stake_amount` if both players have deposited
+- Returns `2 Ã— stake_amount` if both players have deposited
 
 **Errors:**
 - `Error::MatchNotFound`: Invalid `match_id`
@@ -398,6 +493,154 @@ pub fn get_escrow_balance(env: Env, match_id: u64) -> Result<i128, Error>
 let balance = escrow.get_escrow_balance(&match_id);
 // 0, stake_amount, or 2 * stake_amount
 ```
+
+---
+
+#### `list_matches`
+
+Retrieve a paginated list of match IDs.
+
+**Signature:**
+```rust
+pub fn list_matches(env: Env, start: u64, limit: u32) -> Vec<u64>
+```
+
+**Parameters:**
+- `start`: Match ID to start from (inclusive)
+- `limit`: Maximum number of match IDs to return (capped at 100)
+
+**Returns:**
+- `Vec<u64>`: Vector of match IDs from `start` up to the next 100 entries (or fewer)
+
+**Behavior:**
+- Returns match IDs in range `[start, start + limit)` where the limit is automatically capped at **100**
+- If `start >= total_match_count`, returns an empty vector (last page)
+- If fewer matches exist between `start` and `start + limit`, only returns available IDs
+- Empty return indicates the last page has been reached
+
+**Pagination Example:**
+```rust
+let mut start = 0;
+loop {
+    let matches = escrow.list_matches(&start, &100);
+    if matches.is_empty() {
+        break; // Reached the last page
+    }
+    
+    // Process matches...
+    for match_id in &matches {
+        let match_data = escrow.get_match(match_id);
+        println!("Match {}: {:?}", match_id, match_data.state);
+    }
+    
+    // Advance to next page
+    start = start + matches.len() as u64;
+}
+```
+
+**Notes:**
+- Requesting a `limit` greater than 100 does not error; it is silently capped at 100
+- To detect the last page: if the returned vector has fewer entries than requested, you have reached the end
+- All match IDs are returned sequentially (0, 1, 2, ...) regardless of state
+
+---
+
+#### `list_matches_after`
+
+Retrieve a paginated list of match IDs using **cursor-based** (keyset) pagination, a more robust alternative to `list_matches`.
+
+**Signature:**
+```rust
+pub fn list_matches_after(env: Env, after_match_id: u64, limit: u32) -> Vec<u64>
+```
+
+**Parameters:**
+- `after_match_id`: Return IDs strictly greater than this value. Use `u64::MAX` to start from the beginning.
+- `limit`: Maximum number of match IDs to return (capped at 100)
+
+**Returns:**
+- `Vec<u64>`: Vector of match IDs greater than `after_match_id`, up to `limit` entries
+
+**Behavior:**
+- Returns IDs in the range `(after_match_id, after_match_id + limit]` (capped at 100 iterations)
+- **Unambiguous end-of-data**: an empty result always means there are no further matches. Unlike offset-based `list_matches`, a sparse ID space cannot produce a false "gap"
+- Cursor reuse is safe: the same cursor remains valid even if the contract state changes between calls
+- If fewer matches exist after the cursor, only the available IDs are returned
+
+**Pagination Example:**
+```rust
+let mut cursor = u64::MAX; // start before all IDs
+loop {
+    let matches = escrow.list_matches_after(&cursor, &100);
+    if matches.is_empty() {
+        break; // Reached the end of data
+    }
+
+    // Process matches...
+    for match_id in &matches {
+        let match_data = escrow.get_match(match_id);
+        println!("Match {}: {:?}", match_id, match_data.state);
+    }
+
+    // Advance the cursor using the last returned ID
+    cursor = matches.get(matches.len() - 1);
+}
+```
+
+**Notes:**
+- Prefer this function over `list_matches` when iterating matches in sparse ID spaces (e.g. many cancelled matches), since it never misses entries
+- Requesting a `limit` greater than 100 does not error; it is silently capped at 100
+- To detect the last page: an empty vector indicates the end of data
+
+---
+
+#### `list_results`
+
+Retrieve a paginated list of oracle results.
+
+**Signature:**
+```rust
+pub fn list_results(env: Env, start: u64, limit: u32) -> Vec<(u64, ResultEntry)>
+```
+
+**Parameters:**
+- `start`: Match ID to start searching from (inclusive)
+- `limit`: Maximum number of results to return (capped at 100)
+
+**Returns:**
+- `Vec<(u64, ResultEntry)>`: Vector of tuples containing `(match_id, result_entry)` for matches with submitted results
+
+**Behavior:**
+- Scans match IDs starting from `start` up to `start + limit` (capped at 100 iterations)
+- Only returns entries where a result has been submitted via `submit_result`
+- If no results exist in the scanned range, returns an empty vector
+- Unlike `list_matches`, the returned vector may be **shorter than the limit** because skipped IDs (those without results) are not included
+
+**Pagination Example:**
+```rust
+let mut start = 0;
+let mut all_results = Vec::new();
+loop {
+    let results = oracle.list_results(&start, &100);
+    if results.is_empty() {
+        break; // No results found in this range, stop scanning
+    }
+    
+    // Process results...
+    for (match_id, entry) in &results {
+        println!("Match {}: {} -> {:?}", match_id, entry.game_id, entry.result);
+    }
+    
+    // Advance scan position by 100 (not by results.len(), since results can be sparse)
+    start = start + 100;
+}
+```
+
+**Important Differences from list_matches:**
+- `list_results` scans up to 100 match IDs but returns only those with submitted results
+- A page may return fewer entries than the cap (empty matches are skipped)
+- To iterate through all results without gaps, always advance `start` by 100, not by `results.len()`
+- Requesting a `limit` greater than 100 does not error; it is silently capped at 100
 
 ---
 
@@ -624,8 +867,8 @@ Match outcome for the escrow contract's `submit_result`.
 
 ```rust
 pub enum Winner {
-    Player1, // Player1 receives stake_amount × 2
-    Player2, // Player2 receives stake_amount × 2
+    Player1, // Player1 receives stake_amount Ã— 2
+    Player2, // Player2 receives stake_amount Ã— 2
     Draw,    // Each player receives their original stake_amount
 }
 ```
@@ -674,14 +917,25 @@ pub enum Error {
     AlreadyInitialized = 7,  // Contract already initialized (unused; initialize panics instead)
     Overflow           = 8,  // Match counter would exceed u64::MAX
     ContractPaused     = 9,  // Contract is paused; mutating operations are blocked
-    InvalidAmount      = 10, // stake_amount ≤ 0
+    InvalidAmount      = 10, // stake_amount â‰¤ 0
     InvalidGameId      = 11, // game_id is empty or exceeds 64 bytes
     InvalidPlayers     = 12, // player1 == player2 in create_match
     GameIdMismatch     = 13, // Oracle submitted result for the wrong game_id
     DuplicateGameId    = 14, // game_id is already linked to another match
     TransferFailed     = 15, // Token transfer failed
-    MatchCancelled     = 16, // Deposit rejected — match has been cancelled
+    MatchCancelled     = 16, // Deposit rejected â€” match has been cancelled
     MatchCompleted     = 17, // Deposit rejected — match has already completed
+    InvalidToken      = 22, // Token does not match the configured default (legacy; see E028)
+    InvalidAdmin      = 23, // New admin address is invalid
+    StakeTooLow       = 24, // stake_amount below MIN_STAKE
+    StakeTooHigh      = 25, // stake_amount above MAX_STAKE
+    InsufficientReserve = 26, // Balance too low to cover payout + minimum reserve
+    InvalidAddress    = 27, // A player address is the zero/burn address
+    TokenNotAllowlisted = 28, // Token is not on the admin-managed allowlist
+    TokenAlreadyListed  = 29, // add_token called for an already-allowlisted token
+    TokenNotListed      = 30, // remove_token called for a token that is not allowlisted
+    CannotRemoveDefault = 31, // remove_token called for the contract default token
+}
 }
 ```
 
@@ -694,6 +948,8 @@ pub enum Error {
     ResultNotFound     = 3, // No result submitted for this match_id
     AlreadyInitialized = 4, // Contract already initialized
     InvalidGameId      = 5, // game_id is empty or exceeds 64 bytes
+    TransferFailed     = 6, // Token transfer failed
+    InvalidAmount      = 7, // withdraw amount must be > 0
 }
 ```
 
@@ -784,18 +1040,46 @@ Emitted when admin rights are transferred via `transfer_admin`.
 
 ## Constants
 
-### Escrow Contract
+Every ledger duration and identifier limit is defined **once** in
+`contracts/smile4money-common/src/constants.rs` and re-exported by each contract's own
+`constants` module, so the escrow and oracle contracts can never drift apart. The
+TypeScript mirror of the same values is `apps/frontend/src/constants.ts`.
+
+Each constant carries a doc comment citing its source (Stellar documentation, or the
+ADR that decided the policy).
+
+### Shared (escrow + oracle)
+
+`contracts/escrow/src/constants.rs`, `contracts/oracle/src/constants.rs`
 
 ```rust
-const MATCH_TTL_LEDGERS: u32 = 518_400; // ~30 days at 5 s/ledger
-const MAX_GAME_ID_LEN: u32   = 64;      // Maximum game_id byte length
+pub const SECONDS_PER_LEDGER: u32   = 5;         // ~5 s/ledger (Stellar network target)
+pub const LEDGERS_PER_DAY: u32      = 17_280;    // 86_400 / 5
+pub const LEDGERS_PER_WEEK: u32     = 120_960;   // 604_800 / 5
+pub const MATCH_TTL_LEDGERS: u32    = 518_400;   // ~30 days
+pub const DISPUTE_WINDOW_LEDGERS: u32 = LEDGERS_PER_DAY; // ~24 hours (ADR-001)
+pub const TIMEOUT_LEDGERS: u32      = LEDGERS_PER_WEEK;  // ~7 days (ADR-001)
+pub const MAX_GAME_ID_LEN: u32      = 64;        // Maximum game_id byte length
 ```
 
-### Oracle Contract
+### Escrow only
+
+`contracts/escrow/src/constants.rs`
 
 ```rust
-const MATCH_TTL_LEDGERS: u32 = 518_400; // ~30 days at 5 s/ledger
-const MAX_GAME_ID_LEN: u32   = 64;      // Maximum game_id byte length
+pub const MIN_STAKE: i128               = 1;
+pub const MAX_STAKE: i128               = 10_000_000_000_000;
+pub const INSTANCE_LIFETIME_THRESHOLD: u32 = MATCH_TTL_LEDGERS;
+pub const INSTANCE_BUMP_AMOUNT: u32       = MATCH_TTL_LEDGERS;
+pub const ESCROW_RESERVE_BUFFER_STROOPS: i128 = 15_000_000; // 1.5 XLM
+```
+
+### Oracle only
+
+`contracts/oracle/src/constants.rs`
+
+```rust
+pub const MAX_LIST_LIMIT: u32 = 100;
 ```
 
 ---
@@ -986,6 +1270,88 @@ stellar contract invoke \
 # Returns: i128 (0, stake_amount, or 2 * stake_amount)
 ```
 
+#### list_matches
+
+```bash
+stellar contract invoke \
+  --id "$CONTRACT_ESCROW" \
+  --source any-key \
+  --network "$NETWORK" \
+  -- list_matches \
+  --start 0 \
+  --limit 100
+# Returns: Vec<u64> of match IDs [0, 1, 2, ...]
+```
+
+Example with pagination loop (in bash):
+
+```bash
+# Fetch all matches in pages
+start=0
+while true; do
+  matches=$(stellar contract invoke \
+    --id "$CONTRACT_ESCROW" \
+    --source any-key \
+    --network "$NETWORK" \
+    -- list_matches \
+    --start $start \
+    --limit 100)
+  
+  # Check if empty (reached last page)
+  if [ -z "$matches" ] || [ "$matches" = "[]" ]; then
+    break
+  fi
+  
+  # Process matches...
+  echo "Matches from $start: $matches"
+  
+  # Advance by the number of results
+  count=$(echo "$matches" | jq 'length')
+  start=$((start + count))
+done
+```
+
+#### list_results
+
+```bash
+stellar contract invoke \
+  --id "$CONTRACT_ORACLE" \
+  --source any-key \
+  --network "$NETWORK" \
+  -- list_results \
+  --start 0 \
+  --limit 100
+# Returns: Vec<(u64, ResultEntry)> of (match_id, result_entry) pairs
+```
+
+Example with pagination loop (in bash):
+
+```bash
+# Fetch all results in pages
+start=0
+while true; do
+  results=$(stellar contract invoke \
+    --id "$CONTRACT_ORACLE" \
+    --source any-key \
+    --network "$NETWORK" \
+    -- list_results \
+    --start $start \
+    --limit 100)
+  
+  # Check if empty (no results in this range)
+  if [ -z "$results" ] || [ "$results" = "[]" ]; then
+    break
+  fi
+  
+  # Process results...
+  echo "Results from match $start: $results"
+  
+  # Always advance by 100, not by results.len()
+  # (results can be sparse if some matches don't have results yet)
+  start=$((start + 100))
+done
+```
+
 ---
 
 ### Oracle Contract CLI Examples
@@ -1115,7 +1481,7 @@ let match_id = escrow.create_match(...);
 // Player1 deposits
 escrow.deposit(&match_id, &player1);
 
-// Player2 decides not to play — cancels and player1 is refunded
+// Player2 decides not to play â€” cancels and player1 is refunded
 escrow.cancel_match(&match_id, &player2);
 ```
 

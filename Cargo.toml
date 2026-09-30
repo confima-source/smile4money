@@ -3,6 +3,9 @@ members = [
     "contracts/escrow",
     "contracts/oracle",
     "contracts/contract-registry",
+    "contracts/leaderboard",
+    "contracts/smile4money-common",
+    "contracts/tournament-bracket",
 ]
 resolver = "2"
 
@@ -12,6 +15,7 @@ edition = "2021"
 
 [workspace.dependencies]
 soroban-sdk = { version = "22.0.11" }
+smile4money-common = { path = "contracts/smile4money-common" }
 
 [profile.release]
 opt-level = "z"

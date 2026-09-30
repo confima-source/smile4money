@@ -101,6 +101,13 @@ exports[`ClaimBurn — snapshots > matches snapshot: connected state (claim mode
         Claim
       </button>
     </form>
+    <div
+      aria-atomic="true"
+      aria-live="polite"
+      class="rounded-lg p-3 text-sm font-medium transition-all duration-200 overflow-hidden hidden mt-4"
+      data-testid="claim-burn-status"
+      role="status"
+    />
   </div>
   <div
     aria-atomic="true"
@@ -188,6 +195,13 @@ exports[`ClaimBurn — snapshots > matches snapshot: connected state in burn mod
         Claim
       </button>
     </form>
+    <div
+      aria-atomic="true"
+      aria-live="polite"
+      class="rounded-lg p-3 text-sm font-medium transition-all duration-200 overflow-hidden hidden mt-4"
+      data-testid="claim-burn-status"
+      role="status"
+    />
   </div>
   <div
     aria-atomic="true"
@@ -322,6 +336,13 @@ exports[`ClaimBurn — snapshots > matches snapshot: connected state with public
         Claim
       </button>
     </form>
+    <div
+      aria-atomic="true"
+      aria-live="polite"
+      class="rounded-lg p-3 text-sm font-medium transition-all duration-200 overflow-hidden hidden mt-4"
+      data-testid="claim-burn-status"
+      role="status"
+    />
   </div>
   <div
     aria-atomic="true"
@@ -597,17 +618,15 @@ exports[`CreateMatch — snapshots > matches snapshot: Chess.com platform select
         <label
           for="stake-amount"
         >
-          Stake Amount (stroops)
+          Stake Amount (XLM)
         </label>
         <input
           aria-invalid="false"
           data-testid="stake-amount-input"
           id="stake-amount"
-          max="10000000000000"
-          min="1"
-          placeholder="e.g. 10000000 (= 1 XLM)"
-          step="1"
-          type="number"
+          inputmode="decimal"
+          placeholder="e.g. 1.5 (converts to 15,000,000 stroops)"
+          type="text"
           value=""
         />
       </div>
@@ -737,17 +756,15 @@ exports[`CreateMatch — snapshots > matches snapshot: USDC token selected 1`] =
         <label
           for="stake-amount"
         >
-          Stake Amount (stroops)
+          Stake Amount (XLM)
         </label>
         <input
           aria-invalid="false"
           data-testid="stake-amount-input"
           id="stake-amount"
-          max="10000000000000"
-          min="1"
-          placeholder="e.g. 10000000 (= 1 XLM)"
-          step="1"
-          type="number"
+          inputmode="decimal"
+          placeholder="e.g. 1.5 (converts to 15,000,000 stroops)"
+          type="text"
           value=""
         />
       </div>
@@ -877,17 +894,15 @@ exports[`CreateMatch — snapshots > matches snapshot: default state (XLM / Lich
         <label
           for="stake-amount"
         >
-          Stake Amount (stroops)
+          Stake Amount (XLM)
         </label>
         <input
           aria-invalid="false"
           data-testid="stake-amount-input"
           id="stake-amount"
-          max="10000000000000"
-          min="1"
-          placeholder="e.g. 10000000 (= 1 XLM)"
-          step="1"
-          type="number"
+          inputmode="decimal"
+          placeholder="e.g. 1.5 (converts to 15,000,000 stroops)"
+          type="text"
           value=""
         />
       </div>
@@ -1183,8 +1198,15 @@ exports[`MatchStatus — snapshots > matches snapshot: pending state 1`] = `
         class="deposit-status"
         data-testid="deposit-status"
       >
-        <span>
-          Player 1: 
+        <span
+          class="deposit-status-row"
+        >
+          <span
+            class="match-info-label"
+          >
+            Player 1:
+          </span>
+           
           ✓
            
           <span
@@ -1197,9 +1219,14 @@ exports[`MatchStatus — snapshots > matches snapshot: pending state 1`] = `
             )
           </span>
         </span>
-        <br />
-        <span>
-          Player 2:
+        <span
+          class="deposit-status-row"
+        >
+          <span
+            class="match-info-label"
+          >
+            Player 2:
+          </span>
            
           <span
             class="address-small"

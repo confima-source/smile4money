@@ -1,6 +1,7 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec};
+use smile4money_common::constants::MATCH_TTL_LEDGERS;
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -10,6 +11,7 @@ pub enum Error {
     MaxEventsReached = 3,
     ContractNotFound = 4,
     AlreadyRegistered = 5,
+    Overflow = 6,
 }
 
 #[contracttype]
@@ -18,8 +20,13 @@ pub enum DataKey {
     Admin = 0,
     Paused = 1,
     MaxEvents = 2,
-    Registrations = 3,
-    Events = 4,
+    /// Counter of live registrations; kept in instance storage for pagination.
+    RegistrationCount = 3,
+    /// Per-contract registration record, stored in persistent storage under
+    /// its own entry keyed by the contract's `Symbol`. This keeps reads O(1)
+    /// and avoids deserializing (and eventually outgrowing) a single map.
+    Registration(Symbol) = 4,
+    Events = 5,
 }
 
 #[contracttype]
@@ -33,6 +40,18 @@ pub struct ContractRecord {
 #[contract]
 pub struct ContractRegistry;
 
+/// TTL handling for per-registration persistent entries, mirroring how the
+/// escrow contract keeps match records alive.
+const REGISTRATION_TTL_LEDGERS: u32 = 100_000;
+const REGISTRATION_TTL_BUMP: u32 = 50_000;
+
+/// Instance-storage TTL threshold (~30 days at 5 s/ledger).
+/// Shared with the escrow contract so both contracts' instance entries
+/// expire together — see `smile4money_common::constants::MATCH_TTL_LEDGERS`.
+const INSTANCE_LIFETIME_THRESHOLD: u32 = MATCH_TTL_LEDGERS;
+/// Instance-storage TTL bump amount (same 30-day window as the threshold).
+const INSTANCE_BUMP_AMOUNT: u32 = MATCH_TTL_LEDGERS;
+
 #[contractimpl]
 impl ContractRegistry {
     pub fn initialize(env: Env, admin: Address, max_events: u32) -> Result<(), Error> {
@@ -43,104 +62,177 @@ impl ContractRegistry {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
-        env.storage().instance().set(&DataKey::MaxEvents, &max_events);
         env.storage()
             .instance()
-            .set(&DataKey::Registrations, &Map::<Symbol, ContractRecord>::new(&env));
-        env.storage().instance().set(&DataKey::Events, &Vec::<Symbol>::new(&env));
+            .set(&DataKey::MaxEvents, &max_events);
+        env.storage().instance().set(
+            &DataKey::Registrations,
+            &Map::<Symbol, ContractRecord>::new(&env),
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::Events, &Vec::<Symbol>::new(&env));
 
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
     }
 
     pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::Unauthorized)?;
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
         if admin != caller {
             return Err(Error::Unauthorized);
         }
         caller.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
     }
 
     pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::Unauthorized)?;
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
         if admin != caller {
             return Err(Error::Unauthorized);
         }
         caller.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
     }
 
     pub fn register_contract(env: Env, caller: Address, contract_id: Symbol) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::Unauthorized)?;
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
         if admin != caller {
             return Err(Error::Unauthorized);
         }
         caller.require_auth();
 
-        let mut registrations: Map<Symbol, ContractRecord> = env.storage().instance().get(&DataKey::Registrations).unwrap();
+        let mut registrations: Map<Symbol, ContractRecord> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Registrations)
+            .unwrap();
         if registrations.contains_key(contract_id.clone()) {
             return Err(Error::AlreadyRegistered);
         }
 
-        registrations.set(
-            contract_id.clone(),
-            ContractRecord {
+        env.storage().persistent().set(
+            &key,
+            &ContractRecord {
                 registrant: caller.clone(),
                 contract_id: contract_id.clone(),
                 active: true,
             },
         );
-        env.storage().instance().set(&DataKey::Registrations, &registrations);
+        env.storage()
+            .instance()
+            .set(&DataKey::Registrations, &registrations);
         Ok(())
     }
 
     pub fn update_contract(env: Env, caller: Address, contract_id: Symbol) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::Unauthorized)?;
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
         if admin != caller {
             return Err(Error::Unauthorized);
         }
         caller.require_auth();
 
-        let registrations: Map<Symbol, ContractRecord> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Registrations)
-            .unwrap_or_else(|| Map::new(&env));
-        if !registrations.contains_key(contract_id.clone()) {
+        let key = DataKey::Registration(contract_id.clone());
+        if !env.storage().persistent().has(&key) {
             return Err(Error::ContractNotFound);
         }
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
     }
 
-    pub fn deregister_contract(env: Env, caller: Address, contract_id: Symbol) -> Result<(), Error> {
+    pub fn deregister_contract(
+        env: Env,
+        caller: Address,
+        contract_id: Symbol,
+    ) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
-        let mut registrations: Map<Symbol, ContractRecord> = env
+        let key = DataKey::Registration(contract_id.clone());
+        let record: ContractRecord = env
             .storage()
             .instance()
             .get(&DataKey::Registrations)
             .unwrap_or_else(|| Map::new(&env));
-        let record = registrations.get(contract_id.clone()).ok_or(Error::ContractNotFound)?;
+        let record = registrations
+            .get(contract_id.clone())
+            .ok_or(Error::ContractNotFound)?;
         let is_registrant = record.registrant == caller;
         if !is_registrant {
-            let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::Unauthorized)?;
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(Error::Unauthorized)?;
             if admin != caller {
                 return Err(Error::Unauthorized);
             }
         }
         caller.require_auth();
         registrations.remove(contract_id.clone());
-        env.storage().instance().set(&DataKey::Registrations, &registrations);
+        env.storage()
+            .instance()
+            .set(&DataKey::Registrations, &registrations);
         Ok(())
+    }
+
+    /// Number of live registrations. Use this to bound pagination loops.
+    pub fn registration_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RegistrationCount)
+            .unwrap_or(0)
+    }
+
+    /// Fetch a single registration without deserializing the whole registry.
+    pub fn get_registration(env: Env, contract_id: Symbol) -> Result<ContractRecord, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Registration(contract_id))
+            .ok_or(Error::ContractNotFound)
     }
 
     pub fn submit_event(env: Env, caller: Address, event_name: Symbol) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
+        // Only the configured admin may submit registry events.
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::Unauthorized)?;
+        if admin != caller {
+            return Err(Error::Unauthorized);
+        }
         caller.require_auth();
-        let max_events: u32 = env.storage().instance().get(&DataKey::MaxEvents).unwrap_or(0);
+        let max_events: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxEvents)
+            .unwrap_or(0);
         let mut events: Vec<Symbol> = env
             .storage()
             .instance()
@@ -151,11 +243,18 @@ impl ContractRegistry {
         }
         events.push_back(event_name);
         env.storage().instance().set(&DataKey::Events, &events);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
     }
 
     fn ensure_not_paused(env: &Env) -> Result<(), Error> {
-        let paused: bool = env.storage().instance().get(&DataKey::Paused).unwrap_or(false);
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
         if paused {
             return Err(Error::ContractPaused);
         }
