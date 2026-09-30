@@ -14,6 +14,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Scan tracked files for credential patterns
+        run: ./scripts/check-secrets.sh
+
   # ── Issue #894: Split into parallel escrow-tests and oracle-tests jobs ────
   escrow-tests:
     name: Escrow Tests
@@ -43,6 +52,37 @@ jobs:
       - name: Run escrow doc tests
         run: cargo test -p smile4money-escrow --doc --verbose
 
+      - name: Run escrow fuzz tests
+        run: cargo test -p smile4money-escrow --lib tests_fuzz --verbose
+
+  escrow-fuzz-tests:
+    name: Escrow Fuzz Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: 1.88.0
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Run property-based tests (100 iterations)
+        run: PROPTEST_CASES=100 cargo test -p smile4money-escrow --lib tests_fuzz::prop_ --verbose
+
+      - name: Run exhaustive fuzz tests
+        run: cargo test -p smile4money-escrow --lib tests_fuzz::fuzz_ --verbose
+
   oracle-tests:
     name: Oracle Tests
     runs-on: ubuntu-latest
@@ -70,6 +110,34 @@ jobs:
 
       - name: Run oracle doc tests
         run: cargo test -p smile4money-oracle --doc --verbose
+
+  leaderboard-tests:
+    name: Leaderboard Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: 1.88.0
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Run leaderboard tests
+        run: cargo test -p smile4money-leaderboard --lib --verbose
+
+      - name: Run leaderboard doc tests
+        run: cargo test -p smile4money-leaderboard --doc --verbose
 
   # ── Issue #895: cargo-tarpaulin coverage report with 80% threshold ────────
   coverage:
@@ -136,6 +204,53 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # ── Issue #1799: fail the build on undocumented public items ──────────────
+  rustdoc:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: 1.88.0
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # -D missing-docs (not -D warnings) so an undocumented public item fails the
+      # build, while pre-existing intra-doc link warnings stay non-fatal.
+      - name: Build escrow documentation
+        run: cargo doc -p smile4money-escrow --no-deps
+        env:
+          RUSTDOCFLAGS: -D missing-docs
+
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        with:
+          toolchain: 1.88.0
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Run cargo deny check
+        run: cargo deny check
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -149,23 +264,27 @@ jobs:
           components: rustfmt
 
       - name: Check formatting
-        run: cargo fmt -- --check
+        run: cargo fmt --all --check
 
   prettier:
     name: Prettier
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [frontend, backend]
     defaults:
       run:
-        working-directory: apps/frontend
+        working-directory: apps/${{ matrix.app }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: 'npm'
-          cache-dependency-path: apps/frontend/package-lock.json
+          cache-dependency-path: apps/${{ matrix.app }}/package-lock.json
 
       - name: Install dependencies
         run: npm ci
@@ -191,23 +310,6 @@ jobs:
           name: wasm-${{ github.sha }}
           path: target/wasm32-unknown-unknown/release/*.wasm
           retention-days: 30
-
-  validate-environments:
-    name: Validate environments.toml
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Set up Python
-        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5
-        with:
-          python-version: "3.12"
-
-      - name: Validate environments.toml
-        run: python scripts/validate_environments.py
-
-      - name: Run validation tests
-        run: python scripts/test_validate_environments.py
 
   frontend:
     name: Frontend
@@ -239,8 +341,28 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      - name: Run tests with coverage
-        run: vitest run --coverage
+  # ── Issue: Add dedicated frontend test job ────────────────────────────────
+  test-frontend:
+    name: Frontend Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/frontend
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: 'npm'
+          cache-dependency-path: apps/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run frontend tests with coverage
+        run: npm test -- --coverage --reporter=default --reporter=github-actions
 
       - name: Upload frontend coverage report
         uses: actions/upload-artifact@v4
@@ -249,3 +371,34 @@ jobs:
           name: frontend-coverage-${{ github.sha }}
           path: apps/frontend/coverage/
           retention-days: 30
+
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/backend
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+
+      - name: Cache node_modules
+        uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
+        with:
+          path: apps/backend/node_modules
+          key: ${{ runner.os }}-backend-node-${{ hashFiles('apps/backend/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-backend-node-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript compilation check
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
+

@@ -1,4 +1,11 @@
-use soroban_sdk::{contracttype, String};
+use soroban_sdk::{contracttype, Address, String};
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InstanceState {
+    pub admin: Address,
+    pub result_count: u64,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +25,8 @@ pub struct ResultEntry {
 
 #[contracttype]
 pub enum DataKey {
-    Admin,
+    InstanceState,
+    IsInitialized,
     Result(u64), // keyed by match_id
+    PendingAdmin, // proposed new admin address awaiting acceptance
 }

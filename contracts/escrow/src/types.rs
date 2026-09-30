@@ -141,7 +141,20 @@ pub enum Winner {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OptionalWinner {
+    /// No result is pending.
+    ///
+    /// Set when the match is created and after it leaves
+    /// [`MatchState::PendingResult`]. Stored as
+    /// [`Match::pending_winner`].
     None,
+
+    /// A result has been submitted by the oracle and is awaiting finalization.
+    ///
+    /// The wrapped [`Winner`] is set when the match enters
+    /// [`MatchState::PendingResult`] and may be replaced by the admin via
+    /// [`override_result`](crate::EscrowContract::override_result) while the
+    /// dispute window is open. [`finalize_result`](crate::EscrowContract::finalize_result)
+    /// reads it to determine the payout.
     Some(Winner),
 }
 
@@ -239,16 +252,16 @@ pub struct Match {
     /// Recorded when both players have deposited and the match becomes `Active`.
     /// Used by [`claim_timeout`](crate::EscrowContract::claim_timeout) to verify
     /// that `TIMEOUT_LEDGERS` have elapsed without an oracle result.
-    /// `0` when the match has not yet become `Active`.
-    pub activated_ledger: u32,
+    /// `None` when the match has not yet become `Active`.
+    pub activated_ledger: Option<u32>,
 
     /// The ledger sequence number at which the oracle submitted a result
     /// (i.e. when the match transitioned to `PendingResult`).
     ///
     /// Used by [`finalize_result`](crate::EscrowContract::finalize_result) to
-    /// check whether `DISPUTE_WINDOW_LEDGERS` have elapsed. `0` when no result
+    /// check whether `DISPUTE_WINDOW_LEDGERS` have elapsed. `None` when no result
     /// has been submitted yet.
-    pub pending_result_ledger: u32,
+    pub pending_result_ledger: Option<u32>,
 
     /// The winner reported by the oracle, held in limbo during the dispute window.
     ///
@@ -279,16 +292,18 @@ pub struct Match {
 /// All contract state is accessed through these keys. The variants map to
 /// different storage tiers:
 ///
-/// | Key variant        | Storage tier | Description                                  |
-/// |--------------------|--------------|----------------------------------------------|
-/// | `Match(u64)`       | Persistent   | Full [`Match`] record, keyed by match ID     |
-/// | `MatchCount`       | Instance     | Running counter used to assign match IDs     |
-/// | `Oracle`           | Instance     | Address of the trusted oracle contract       |
-/// | `Admin`            | Instance     | Address of the contract administrator        |
-/// | `Paused`           | Instance     | Boolean pause flag                           |
-/// | `Token`            | Instance     | Default SEP-41 token address                 |
-/// | `SafeAddress`      | Instance     | Pre-registered destination for emergency_drain |
-/// | `GameId(String)`   | Persistent   | Deduplication index: game_id → match ID      |
+/// | Key variant                | Storage tier | Description                                  |
+/// |----------------------------|--------------|----------------------------------------------|
+/// | `Match(u64)`               | Persistent   | Full [`Match`] record, keyed by match ID     |
+/// | `MatchCount`               | Instance     | Running counter used to assign match IDs     |
+/// | `Oracle`                   | Instance     | Address of the trusted oracle contract       |
+/// | `Admin`                    | Instance     | Address of the contract administrator        |
+/// | `Paused`                   | Instance     | Boolean pause flag                           |
+/// | `Token`                    | Instance     | Default SEP-41 token address                 |
+/// | `SafeAddress`              | Instance     | Pre-registered destination for emergency_drain |
+/// | `DisputeWindowLedgers`     | Instance     | Configurable dispute window duration in ledgers |
+/// | `TimeoutLedgers`           | Instance     | Configurable match timeout duration in ledgers |
+/// | `GameId(String)`           | Persistent   | Deduplication index: game_id → match ID      |
 ///
 /// Instance-tier keys share the contract's instance TTL. Persistent-tier keys
 /// have their own TTL extended to `MATCH_TTL_LEDGERS` on every write.
@@ -339,19 +354,57 @@ pub enum DataKey {
     /// The default SEP-41 token address used for staking.
     ///
     /// Set during [`initialize`](crate::EscrowContract::initialize). Each
-    /// [`Match`] also stores its own `token` field, which may differ if
-    /// per-match tokens are supported in future versions.
+    /// [`Match`] also stores its own `token` field, which is the token the
+    /// allowlist approved at creation time and the token its deposits and
+    /// payout use.
+    ///
+    /// This is the contract's *default* token, not the only permitted one:
+    /// [`add_token`](crate::EscrowContract::add_token) can extend the accepted
+    /// set, and it is seeded into the allowlist automatically by `initialize`
+    /// so an existing deployment keeps working unchanged.
     /// Stored in **instance** storage.
     Token,
 
+    /// Whether a given SEP-41 token is on the accepted-token allowlist.
+    ///
+    /// Presence of the key means "allowed"; absence means "rejected". A boolean
+    /// is stored rather than a `Vec<Address>` so that checking a token is a
+    /// single storage read with a fixed cost, independent of how many tokens
+    /// are allowlisted — iterating a list on the `create_match` path would
+    /// make match creation more expensive every time a token is added.
+    ///
+    /// Seeded with [`Token`](DataKey::Token) by `initialize` and maintained
+    /// exclusively by the admin via
+    /// [`add_token`](crate::EscrowContract::add_token) and
+    /// [`remove_token`](crate::EscrowContract::remove_token).
+    /// Stored in **persistent** storage, bumped alongside the match entries.
+    TokenAllowlisted(Address),
+
     /// The pre-registered destination address for [`emergency_drain`](crate::EscrowContract::emergency_drain).
     ///
-    /// Set immutably during [`initialize`](crate::EscrowContract::initialize).
-    /// `emergency_drain` always transfers funds to this address — it cannot
-    /// be overridden at call time. This eliminates the rug-pull vector where
-    /// a compromised admin key could redirect the drain to an arbitrary address.
+    /// Write-once: the only write is during [`initialize`](crate::EscrowContract::initialize),
+    /// and there is deliberately no setter. `emergency_drain` always transfers funds to this
+    /// address — it cannot be overridden at call time. This prevents a compromised admin key
+    /// from redirecting the drain to an arbitrary address and stealing escrowed funds.
     /// Stored in **instance** storage.
     SafeAddress,
+
+    /// The configured dispute window duration in ledgers.
+    ///
+    /// Set during [`initialize`](crate::EscrowContract::initialize). Determines
+    /// how long the admin has to call [`override_result`](crate::EscrowContract::override_result)
+    /// after the oracle submits a result. Defaults to `DISPUTE_WINDOW_LEDGERS`
+    /// (~24 hours) if not provided. Stored in **instance** storage.
+    DisputeWindowLedgers,
+
+    /// The configured match timeout duration in ledgers.
+    ///
+    /// Set during [`initialize`](crate::EscrowContract::initialize). Determines
+    /// how long a match can remain `Active` without an oracle result before
+    /// either player may call [`claim_timeout`](crate::EscrowContract::claim_timeout)
+    /// to reclaim their stakes. Defaults to `TIMEOUT_LEDGERS` (~7 days) if not
+    /// provided. Stored in **instance** storage.
+    TimeoutLedgers,
 
     /// Deduplication index mapping a `game_id` string to its match ID.
     ///

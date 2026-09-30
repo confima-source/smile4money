@@ -3,9 +3,15 @@ import type { WalletStatus, Network } from '../types';
 import { useDebounce } from '../hooks/useDebounce';
 import { useToast } from './Toast';
 import { TxHash } from './TxHash';
+import { TransactionStatus } from './TransactionStatus';
 
 type Mode = 'claim' | 'burn';
-type Status = 'idle' | 'confirm' | 'pending' | 'success' | 'error';
+type Status = 'idle' | 'simulating' | 'confirm' | 'pending' | 'success' | 'error';
+
+export interface TransactionSimulationResponse {
+  minResourceFee?: string;
+  error?: string;
+}
 
 interface TxRecord {
   mode: Mode;
@@ -14,11 +20,15 @@ interface TxRecord {
   timestamp: number;
 }
 
-interface ClaimBurnProps {
+export interface ClaimBurnProps {
   walletState: WalletStatus;
   onConnect?: () => void;
   onClaim?: (amount: string) => Promise<string | void>;
   onBurn?: (amount: string) => Promise<string | void>;
+  onSimulateTransaction?: (
+    mode: Mode,
+    amount: string,
+  ) => Promise<TransactionSimulationResponse>;
   onSwitchNetwork?: () => void;
   onDisconnect?: () => void;
   onRefreshBalance?: () => void;
@@ -35,11 +45,18 @@ function isValidAmount(value: string): boolean {
   return value.trim() !== '' && !isNaN(n) && n > 0;
 }
 
+function formatStroopsAsXlm(stroops: string): string {
+  const wholeXlm = stroops.slice(0, -7) || '0';
+  const fractionalXlm = stroops.slice(-7).padStart(7, '0').replace(/0+$/, '');
+  return fractionalXlm ? `${wholeXlm}.${fractionalXlm}` : wholeXlm;
+}
+
 export function ClaimBurn({
   walletState,
   onConnect,
   onClaim,
   onBurn,
+  onSimulateTransaction,
   onSwitchNetwork,
   onDisconnect,
   onRefreshBalance,
@@ -52,6 +69,7 @@ export function ClaimBurn({
   const [mode, setMode] = useState<Mode>('claim');
   const [inputAmount, setInputAmount] = useState('');
   const [confirmAmount, setConfirmAmount] = useState('');
+  const [estimatedFee, setEstimatedFee] = useState<string | null>(null);
   const [status, setStatus] = useState<Status>('idle');
   const [errorMsg, setErrorMsg] = useState('');
   const [txHash, setTxHash] = useState<string | null>(null);
@@ -79,6 +97,7 @@ export function ClaimBurn({
     setStatus('idle');
     setTxHash(null);
     setErrorMsg('');
+    setEstimatedFee(null);
   }
 
   function handleToggle(newMode: Mode) {
@@ -99,8 +118,9 @@ export function ClaimBurn({
     }
   }
 
-  function handleRequestSubmit(e: React.FormEvent<HTMLFormElement>) {
+  async function handleRequestSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (isBusy) return;
     if (!isValidAmount(inputAmount)) {
       setStatus('error');
       setErrorMsg('Please enter a valid amount greater than 0.');
@@ -113,8 +133,33 @@ export function ClaimBurn({
       setTxHash(null);
       return;
     }
-    setConfirmAmount(inputAmount);
-    setStatus('confirm');
+    setStatus('simulating');
+    setErrorMsg('');
+    setEstimatedFee(null);
+    try {
+      if (!onSimulateTransaction) {
+        throw new Error('Transaction simulation is unavailable.');
+      }
+      const simulation = await onSimulateTransaction(mode, inputAmount);
+      if (simulation.error) {
+        throw new Error(simulation.error);
+      }
+      if (
+        typeof simulation.minResourceFee !== 'string' ||
+        !/^\d+$/.test(simulation.minResourceFee)
+      ) {
+        throw new Error('The transaction fee could not be estimated.');
+      }
+      setConfirmAmount(inputAmount);
+      setEstimatedFee(simulation.minResourceFee);
+      setStatus('confirm');
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'The transaction fee could not be estimated.';
+      setStatus('error');
+      setErrorMsg(message);
+      toast.error('Transaction simulation failed', message);
+    }
   }
 
   const handleConfirm = useCallback(async () => {
@@ -148,6 +193,7 @@ export function ClaimBurn({
   }
 
   const isPending = status === 'pending';
+  const isBusy = isPending || status === 'simulating';
   const showConfirm = status === 'confirm';
   const valid = isValidAmount(inputAmount);
 
@@ -328,6 +374,7 @@ export function ClaimBurn({
           type="button"
           className={`toggle-btn${mode === 'claim' ? ' active' : ''} focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2`}
           onClick={() => handleToggle('claim')}
+          disabled={isBusy}
           aria-pressed={mode === 'claim'}
           data-testid="toggle-claim"
           aria-label="Switch to claim mode"
@@ -338,6 +385,7 @@ export function ClaimBurn({
           type="button"
           className={`toggle-btn${mode === 'burn' ? ' active' : ''} focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2`}
           onClick={() => handleToggle('burn')}
+          disabled={isBusy}
           aria-pressed={mode === 'burn'}
           data-testid="toggle-burn"
           aria-label="Switch to burn mode"
@@ -406,6 +454,15 @@ export function ClaimBurn({
           <p className="dark:text-slate-100 mb-4 text-base font-semibold text-slate-900">
             {mode === 'claim' ? 'Claim' : 'Burn'} <strong>{confirmAmount}</strong> {tokenSymbol}?
           </p>
+          {estimatedFee !== null && (
+            <p
+              className="mb-4 text-sm text-slate-600 dark:text-slate-300"
+              data-testid="estimated-fee"
+            >
+              Estimated fee: <strong>{estimatedFee} stroops</strong> (
+              <strong>{formatStroopsAsXlm(estimatedFee)} XLM</strong>)
+            </p>
+          )}
           <div className="grid grid-cols-2 gap-3">
             <button
               type="button"
@@ -452,7 +509,7 @@ export function ClaimBurn({
               pattern="^[0-9]*(?:[.,][0-9]*)?$"
               value={inputAmount}
               onChange={handleAmountChange}
-              disabled={isPending}
+              disabled={isBusy}
               placeholder="0.00"
               data-testid="amount-input"
               aria-invalid={inputAmount !== '' && !valid}
@@ -464,7 +521,7 @@ export function ClaimBurn({
               <button
                 type="button"
                 onClick={handleMax}
-                disabled={isPending}
+                disabled={isBusy}
                 data-testid="max-btn"
                 aria-label="Use maximum balance"
                 className="btn-max dark:bg-slate-800 dark:border-slate-600 dark:text-violet-400 dark:hover:bg-slate-700 shrink-0 rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm font-semibold text-violet-600 transition-colors hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-50"
@@ -484,12 +541,14 @@ export function ClaimBurn({
           <button
             type="submit"
             className={`btn btn-${mode} focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2`}
-            disabled={isPending || !valid || walletState !== 'connected'}
+            disabled={isBusy || !valid || walletState !== 'connected'}
             data-testid="submit-btn"
-            aria-busy={isPending}
+            aria-busy={isBusy}
             aria-label={`${mode === 'claim' ? 'Claim' : 'Burn'} tokens`}
           >
-            {isPending
+            {status === 'simulating'
+              ? 'Estimating fee…'
+              : isPending
               ? mode === 'claim'
                 ? 'Claiming…'
                 : 'Burning…'
@@ -500,35 +559,36 @@ export function ClaimBurn({
         )}
       </form>
 
-      {/* Feedback */}
-      {status === 'success' && (
-        <p
-          className="dark:border-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-400 mt-4 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-center text-sm font-medium text-emerald-800"
-          role="status"
-          data-testid="success-msg"
-        >
-          {mode === 'claim'
+      {/* Transaction status with aria-live announcements */}
+      <TransactionStatus
+        status={status as any}
+        pendingMessage={mode === 'claim' ? 'Claiming tokens…' : 'Burning tokens…'}
+        successMessage={
+          mode === 'claim'
             ? `${tokenSymbol} claimed successfully!`
-            : `${tokenSymbol} burned successfully!`}
-          {txHash && (
-            <a
-              href={`https://stellar.expert/explorer/${network === 'unknown' ? 'testnet' : network}/tx/${txHash}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="dark:text-violet-400 mt-2 block break-all font-mono text-xs text-violet-600 underline hover:no-underline"
-              data-testid="tx-hash"
-              aria-label={`View transaction ${txHash} on Stellar Expert`}
-            >
-              {txHash.slice(0, 8)}…{txHash.slice(-8)} ↗
-            </a>
-          )}
-        </p>
-      )}
-      {status === 'error' && (
-        <p className="feedback error" role="alert" data-testid="error-msg" id="claim-burn-error">
-          {errorMsg}
-        </p>
-      )}
+            : `${tokenSymbol} burned successfully!`
+        }
+        errorMessage={errorMsg}
+        txHash={txHash}
+        testId="claim-burn-status"
+        className="mt-4"
+        renderTxHashLink={
+          txHash
+            ? (hash) => (
+                <a
+                  href={`https://stellar.expert/explorer/${network === 'unknown' ? 'testnet' : network}/tx/${hash}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="dark:text-blue-300 dark:hover:text-blue-200 break-all font-mono text-xs underline hover:no-underline"
+                  data-testid="tx-hash"
+                  aria-label={`View transaction ${hash} on Stellar Expert`}
+                >
+                  {hash.slice(0, 8)}…{hash.slice(-8)} ↗
+                </a>
+              )
+            : undefined
+        }
+      />
     </div>
   );
 }

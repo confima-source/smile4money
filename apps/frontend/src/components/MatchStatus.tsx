@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Networks, rpc } from '@stellar/stellar-sdk';
+import { DISPUTE_WINDOW_LEDGERS, SECONDS_PER_LEDGER } from '../constants';
 
 type MatchState = 'Pending' | 'Active' | 'PendingResult' | 'Completed' | 'Cancelled';
 
@@ -49,15 +50,6 @@ type FetchStatus = 'idle' | 'loading' | 'error';
 const TERMINAL_STATES: MatchState[] = ['Completed', 'Cancelled'];
 
 /**
- * Must match `DISPUTE_WINDOW_LEDGERS` in `contracts/escrow/src/lib.rs`.
- * 17 280 ledgers × 5 s / ledger = 86 400 s = 24 hours.
- */
-const DISPUTE_WINDOW_LEDGERS = 17_280;
-
-/** Average Stellar ledger close time in seconds. */
-const LEDGER_CLOSE_SECS = 5;
-
-/**
  * Compute how many seconds remain in the dispute window.
  *
  * @param pendingResultLedger  The ledger at which submit_result was called.
@@ -71,7 +63,7 @@ function computeDisputeSecondsRemaining(
   elapsedSeconds: number,
 ): number {
   const ledgersRemaining = pendingResultLedger + DISPUTE_WINDOW_LEDGERS - currentLedger;
-  const secondsFromLedgers = ledgersRemaining * LEDGER_CLOSE_SECS;
+  const secondsFromLedgers = ledgersRemaining * SECONDS_PER_LEDGER;
   return Math.max(0, secondsFromLedgers - elapsedSeconds);
 }
 
@@ -128,21 +120,37 @@ export function MatchStatus({
     }
   }, [matchId, onFetchMatch]);
 
+  // Track latest match state in a ref so the polling interval can read it
+  // without being recreated on every data update.
+  const matchDataRef = React.useRef<MatchData | null>(null);
+  useEffect(() => {
+    matchDataRef.current = matchData;
+  }, [matchData]);
+
   useEffect(() => {
     if (!matchId) return;
 
-    // Initial fetch - set loading status first
+    // Initial fetch on mount / matchId change
     setFetchStatus('loading');
     fetchMatch();
 
-    // Only poll if not in a terminal state
-    if (matchData && TERMINAL_STATES.includes(matchData.state)) {
-      return; // Don't poll for terminal states
-    }
+    // Poll every 10 seconds; stop automatically when a terminal state is reached.
+    // The interval is intentionally NOT re-created when matchData changes — we
+    // read the latest value through matchDataRef inside the callback instead.
+    const interval = setInterval(() => {
+      if (
+        matchDataRef.current &&
+        TERMINAL_STATES.includes(matchDataRef.current.state)
+      ) {
+        clearInterval(interval);
+        return;
+      }
+      fetchMatch();
+    }, 10_000);
 
-    const interval = setInterval(fetchMatch, 5000);
     return () => clearInterval(interval);
-  }, [matchId, fetchMatch, matchData]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matchId, fetchMatch]);
 
   // Tick every second while in PendingResult to keep the countdown live.
   // The ticker is intentionally separate from the polling interval so it can
@@ -222,17 +230,16 @@ export function MatchStatus({
             <h3 className="state-title">Pending</h3>
             <p className="state-description">Waiting for both players to deposit their stakes.</p>
             <div className="deposit-status" data-testid="deposit-status">
-              <span>
-                Player 1: {p1Deposited}{' '}
+              <span className="deposit-status-row">
+                <span className="match-info-label">Player 1:</span> {p1Deposited}{' '}
                 {matchData.player1 && (
                   <span className="address-small">
                     ({matchData.player1.slice(0, 4)}...{matchData.player1.slice(-4)})
                   </span>
                 )}
               </span>
-              <br />
-              <span>
-                Player 2:{' '}
+              <span className="deposit-status-row">
+                <span className="match-info-label">Player 2:</span>{' '}
                 {matchData.player2 && (
                   <span className="address-small">
                     ({matchData.player2.slice(0, 4)}...{matchData.player2.slice(-4)})
@@ -397,6 +404,14 @@ export function MatchStatus({
       <div className="match-id-display" data-testid="match-id-display">
         Match ID: <strong>{matchData.id}</strong>
       </div>
+      {fetchStatus === 'error' && (
+        <div className="feedback warning" role="alert" data-testid="match-refresh-warning">
+          <span>Unable to refresh — showing last known state.</span>{' '}
+          <button type="button" className="btn btn-retry" onClick={fetchMatch}>
+            Retry?
+          </button>
+        </div>
+      )}
       {renderStateContent()}
     </div>
   );

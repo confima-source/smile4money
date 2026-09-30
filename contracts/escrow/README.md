@@ -16,6 +16,9 @@ A Soroban smart contract for trustless chess match wagering on Stellar. It holds
 - [Public Functions](#public-functions)
   - [initialize](#initialize)
   - [update_oracle](#update_oracle)
+  - [add_token](#add_token)
+  - [remove_token](#remove_token)
+  - [is_token_allowlisted](#is_token_allowlisted)
   - [pause](#pause)
   - [unpause](#unpause)
   - [create_match](#create_match)
@@ -27,6 +30,7 @@ A Soroban smart contract for trustless chess match wagering on Stellar. It holds
   - [get_escrow_balance](#get_escrow_balance)
 - [Match Lifecycle](#match-lifecycle)
 - [Events](#events)
+- [Testing](#testing)
 - [Security Notes](#security-notes)
 
 ---
@@ -189,6 +193,73 @@ client.update_oracle(&new_oracle_address);
 
 ---
 
+### `add_token`
+
+Allowlists a SEP-41 token so that `create_match` may name it. Only the admin
+can call this. Emits `("admin", "token_add")`.
+
+```rust
+pub fn add_token(env: Env, token: Address, caller: Address) -> Result<(), Error>
+```
+
+The token is probed (its `decimals` is read) so a typo or a non-token address is
+rejected at configuration time rather than later at a player's deposit.
+
+Allowlisting a token is **not** an endorsement of it — it only records that the
+admin accepts it as a stake currency. The allowlist exists so an arbitrary
+caller cannot point the escrow at a contract of their choosing; deciding which
+currencies to list stays with the admin, and every change is recorded on-chain.
+
+**Errors**
+
+| Error | Condition |
+|-------|-----------|
+| `Unauthorized` | Caller is not the admin |
+| `TokenAlreadyListed` | The token is already allowlisted |
+
+---
+
+### `remove_token`
+
+Removes a token from the allowlist so no new match may be created in it. Only
+the admin can call this. Emits `("admin", "token_del")`.
+
+```rust
+pub fn remove_token(env: Env, token: Address, caller: Address) -> Result<(), Error>
+```
+
+**In-flight matches are unaffected.** Removal blocks *new* matches only; it does
+not touch matches that already exist. Their escrows stay in that token and
+still settle and pay out there, so a player who funded a match is never stranded
+mid-game. This is how a broken currency can be delisted safely.
+
+**Errors**
+
+| Error | Condition |
+|-------|-----------|
+| `Unauthorized` | Caller is not the admin |
+| `TokenNotListed` | The token was not allowlisted |
+| `CannotRemoveDefault` | The token is the contract's default token |
+
+The default token set at `initialize` cannot be removed — otherwise the contract
+could be left accepting no token at all, with no way to recover short of an
+upgrade.
+
+---
+
+### `is_token_allowlisted`
+
+Read-only check of whether a token is currently accepted.
+
+```rust
+pub fn is_token_allowlisted(env: Env, token: Address) -> bool
+```
+
+Lets a frontend grey out a currency selector without attempting a doomed
+`create_match`. The default token is always allowlisted.
+
+---
+
 ### `pause`
 
 Pauses the contract. Blocks `create_match`, `deposit`, and `submit_result`. Only the admin can call this.
@@ -255,7 +326,7 @@ pub fn create_match(
     player1: Address,
     player2: Address,
     stake_amount: i128,
-    token: Address,
+    token: Option<Address>,
     game_id: String,
     platform: Platform,
 ) -> Result<u64, Error>
@@ -268,9 +339,13 @@ pub fn create_match(
 | `player1` | `Address` | First player; must authorize this call |
 | `player2` | `Address` | Second player |
 | `stake_amount` | `i128` | Amount each player must deposit (must be > 0) |
-| `token` | `Address` | The Stellar asset contract address used for staking |
+| `token` | `Option<Address>` | SEP-41 token for this match. `None` uses the contract's default token. A non-`None` value must be on the admin-managed allowlist (see [`add_token`](#add_token)). |
 | `game_id` | `String` | Unique identifier for the chess game (max 64 bytes) |
 | `platform` | `Platform` | Chess platform (`Lichess` or `ChessDotCom`) |
+
+The resolved token is stored on the match and is the token `deposit` pulls and
+the payout pays out in. Matches in different tokens can run side by side in the
+same contract.
 
 **Returns** `Ok(u64)` — the new match ID (auto-incremented from 0).
 
@@ -601,6 +676,96 @@ create_match()
 | `("admin", "oracle")` | `new_oracle` | `update_oracle` |
 | `("admin", "paused")` | `()` | `pause` |
 | `("admin", "unpaused")` | `()` | `unpause` |
+
+---
+
+## Testing
+
+### Running Tests Locally
+
+This contract includes comprehensive unit tests and property-based fuzz tests using [proptest](https://docs.rs/proptest/1.0.0/proptest/). All tests can be run locally with standard Rust tooling.
+
+#### Prerequisites
+
+- Rust 1.88.0 or later
+- Soroban SDK and targets installed:
+  ```bash
+  rustup install 1.88.0
+  rustup target add wasm32-unknown-unknown
+  ```
+
+#### Run All Tests
+
+```bash
+cargo test -p smile4money-escrow --lib
+```
+
+#### Run Only Unit Tests
+
+```bash
+cargo test -p smile4money-escrow --lib tests:: -- --skip tests_fuzz
+```
+
+#### Run Only Fuzz Tests
+
+```bash
+cargo test -p smile4money-escrow --lib tests_fuzz
+```
+
+#### Run Property-Based Tests with Increased Iterations
+
+By default, proptest runs 256 iterations per test. To increase coverage (useful for finding rare edge cases), set the `PROPTEST_CASES` environment variable:
+
+```bash
+PROPTEST_CASES=1000 cargo test -p smile4money-escrow --lib tests_fuzz::prop_
+```
+
+#### Run Exhaustive Fuzz Tests Only
+
+The exhaustive fuzz tests exercise exact boundary conditions and known-bad inputs:
+
+```bash
+cargo test -p smile4money-escrow --lib tests_fuzz::fuzz_
+```
+
+### Fuzz Test Coverage
+
+The fuzz test suite (`src/tests_fuzz.rs`) covers:
+
+#### Stake Amount Validation
+
+- **Valid range**: Tests that amounts in `[MIN_STAKE, MAX_STAKE]` are accepted
+- **Below minimum**: Tests that stakes < `MIN_STAKE` are rejected with `StakeTooLow`
+- **Above maximum**: Tests that stakes > `MAX_STAKE` are rejected with `StakeTooHigh`
+- **Boundaries**: Exact tests for `MIN_STAKE`, `MIN_STAKE-1`, `MAX_STAKE`, `MAX_STAKE+1`, zero, and negative values
+
+#### Game ID Validation
+
+- **Valid IDs**: Tests accept alphanumeric strings, underscores, and hyphens in the range `[1, 64]` bytes
+- **Empty strings**: Tests reject empty game IDs with `InvalidGameId`
+- **Oversized IDs**: Tests reject game IDs > 64 bytes with `InvalidGameId`
+- **Invalid characters**: Tests reject game IDs containing `@`, `#`, `.`, `/`, spaces, null bytes, and other non-alphanumeric characters with `InvalidGameId`
+- **Length boundaries**: Exact tests for IDs at `MAX_GAME_ID_LEN`, one over, and one under
+
+#### Address Validation
+
+- **Identical players**: Tests reject `player1 == player2` with `InvalidPlayers`
+- **Distinct players**: Tests accept two different valid addresses
+- **Zero address**: Implementation already handles zero addresses (XDR-based check in `is_zero_address`)
+
+### CI Integration
+
+All fuzz tests are automatically run in the CI pipeline:
+
+1. **Escrow Fuzz Tests Job** — runs in GitHub Actions on every push to `master` and on all pull requests
+   - Property-based tests: 100 iterations per test via `PROPTEST_CASES=100`
+   - Exhaustive fuzz tests: All boundary and character validation tests
+
+To view CI test results:
+
+```bash
+# Check GitHub Actions: https://github.com/obajecollinsmicheal-cmd/smile4money/actions
+```
 
 ---
 
